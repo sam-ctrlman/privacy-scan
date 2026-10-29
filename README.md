@@ -45,22 +45,28 @@ regex = '''(?i)(word1|word2)'''
 | `privacy-scan <repo> [branch]` | Scan (branch defaults to `production`, else `main`) |
 | `--verify` | trufflehog check of any secret found |
 | `--detail` | List each matched word / email (prints private text) |
+| `--allowed` | List where `.privacy-allow` hid a match: entry → file:line |
 | `privacy-scan install` / `uninstall` | Create / remove bin + Claude command symlinks |
 
 ## What blocks and what warns
 
 - **ships**: the branch's files plus local build output (`.next/static`, `.next/server/app`). Any private word,
-  secret or foreign email here **blocks** (exit 1).
+  secret or foreign email here **blocks** (exit 1). A branch other than `production` is scanned minus
+  its `.release-exclude` paths, so you see what a release of it would ship.
 - **history**: every commit and every author/committer email. Findings only **warn**: history can't be
   cleaned without a rewrite.
 
 ## `.privacy-allow`
 
 ```
-word: my-brand            # a private word that is this project's own public name
-email: dev@example.com    # an allowed email (author or in files); fnmatch patterns ok
+word: my-brand                          # this project's own public name, allowed everywhere
+word: build-host  in: deploy/*.cjs      # allowed only in these files; elsewhere it still blocks
+email: dev@example.com                  # an allowed email (author or in files); fnmatch patterns ok
 email: *@example.com
 ```
+
+Nothing is hidden silently: every match an entry hides is counted (`allowed=N`) and
+`--allowed` lists it per entry as `file:line` (history: `file:line @commit`).
 
 GitHub noreply addresses and the repo's local `user.email` are always allowed. Keep the file out of what
 ships: `init <repo>` adds it to `.release-exclude`.

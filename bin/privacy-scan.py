@@ -7,22 +7,26 @@ Usage:
   privacy-scan <repo> [branch]       # scan; branch defaults to production, else main
   privacy-scan <repo> [branch] --verify   # + trufflehog: is a found secret still live?
   privacy-scan <repo> [branch] --detail   # per-word / per-email counts (prints private text!)
+  privacy-scan <repo> [branch] --allowed  # where .privacy-allow hid a match: entry → file:line
   privacy-scan install | uninstall   # symlinks into ~/.local/bin + ~/.claude/commands
 
 What it checks:
   ships   = the branch's files + the local build output (public/ is in the tree;
             .next/static, .next/server/app). Private words, secrets and foreign
-            email addresses here BLOCK (exit 1).
+            email addresses here BLOCK (exit 1). A branch other than production
+            is scanned minus its .release-exclude paths (what a release would ship).
   history = every commit (gitleaks git --all) + every author/committer email.
             Findings here only WARN: history can't be cleaned without a rewrite.
 
 A private word is a match of the `private-word` rule in the gitleaks config
 (default ~/.config/gitleaks/private.toml, override with PRIVACY_SCAN_CONFIG).
 <repo>/.privacy-allow lists the repo's exceptions, one per line:
-  word: <text>      a private word that is this project's own public name
-  email: <pattern>  an allowed email (author or in files); fnmatch, e.g. *@example.com
+  word: <text>                  a private word that is this project's own public name
+  word: <text>  in: <glob>, …   allowed only in those files (fnmatch on the repo path)
+  email: <pattern>              an allowed email (author or in files); fnmatch, e.g. *@example.com
+Every match an entry hides is still counted (allowed=N) and listed with --allowed.
 
-Output is counts only unless --detail. Exit codes: 0 clean (warnings allowed),
+Output is counts only unless --detail / --allowed. Exit codes: 0 clean (warnings allowed),
 1 findings that block, 2 usage, 4 config missing, 5 gitleaks missing.
 
 Scaffolded by `forge`. The tool name is derived from the repo directory, so
@@ -70,6 +74,8 @@ EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.([A-Za
 NOT_TLD = {"png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "ico", "js", "mjs", "cjs", "css", "map",
            "json", "ts", "tsx", "jsx", "md", "mdx", "html", "txt", "woff", "woff2", "ttf", "otf"}
 TEXT_MAX = 5 * 1024 * 1024
+ALLOWED_FILES_SHOWN = 10                 # --allowed: files per entry
+ALLOWED_LINES_SHOWN = 8                  # --allowed: line numbers per file
 
 # name → (required, pacman, apt, brew); None = not in that manager's main repos
 PACKAGES = {
@@ -198,8 +204,10 @@ def _repo_path(repo: str) -> Path:
     return path
 
 
-def load_allow(repo: Path) -> tuple[set[str], list[str]]:
-    words, emails = set(), list(NOREPLY)
+def load_allow(repo: Path) -> tuple[dict[str, list[str]], list[str]]:
+    """words: word → path globs it is allowed in ([] = the whole repo); emails: fnmatch patterns."""
+    words: dict[str, list[str]] = {}
+    emails = list(NOREPLY)
     me = _git(repo, "config", "--local", "user.email")
     if me:
         emails.append(me)
@@ -211,10 +219,20 @@ def load_allow(repo: Path) -> tuple[set[str], list[str]]:
             if line.lstrip().startswith("#") or not value:
                 continue
             if key.strip() == "word":
-                words.add(value.lower())
+                parts = re.split(r"\s+in:\s*", value, maxsplit=1)
+                word, scope = parts[0], parts[1] if len(parts) == 2 else ""
+                globs = [g.strip() for g in scope.split(",") if g.strip()]
+                words.setdefault(word.strip().lower(), []).extend(globs or [""])
             elif key.strip() == "email":
                 emails.append(value.lower())
     return words, emails
+
+
+def word_allowed(word: str, rel: str, allow_words: dict[str, list[str]]) -> bool:
+    globs = allow_words.get(word)
+    if globs is None:
+        return False
+    return any(g == "" or fnmatch.fnmatch(rel, g) for g in globs)
 
 
 def email_ok(email: str, allowed: list[str]) -> bool:
@@ -241,26 +259,36 @@ class Section:
         self.words: Counter = Counter()
         self.secrets: Counter = Counter()
         self.emails: Counter = Counter()
+        # what .privacy-allow hid: entry → location → count (shown so nothing is hidden silently)
+        self.allowed: dict[str, Counter] = {}
 
     def total(self) -> int:
         return sum(self.words.values()) + sum(self.secrets.values()) + sum(self.emails.values())
 
-    def add_leaks(self, findings: list[dict], allow_words: set[str], root: Path | None) -> None:
+    def _allow(self, entry: str, where: str) -> None:
+        self.allowed.setdefault(entry, Counter())[where] += 1
+
+    def add_leaks(self, findings: list[dict], allow_words: dict[str, list[str]],
+                  root: Path | None, prefix: str = "") -> None:
         for f in findings:
             file = f.get("File", "")
-            rel = os.path.relpath(file, root) if root and file.startswith(str(root)) else file
+            rel = prefix + (os.path.relpath(file, root) if root and file.startswith(str(root)) else file)
             if SKIP.search("/" + rel):
                 continue
             if f.get("RuleID") == PRIVATE_RULE:
                 word = (f.get("Secret") or f.get("Match") or "").lower()
-                if word not in allow_words:
+                if word_allowed(word, rel, allow_words):
+                    commit = f.get("Commit", "")
+                    self._allow(f"word {word}", f"{rel}:{f.get('StartLine', '?')}"
+                                                + (f" @{commit[:7]}" if commit else ""))
+                else:
                     self.words[word] += 1
             else:
                 self.secrets[f.get("RuleID", "?")] += 1
 
-    def add_emails(self, root: Path, allowed: list[str]) -> None:
+    def add_emails(self, root: Path, allowed: list[str], prefix: str = "") -> None:
         for path in root.rglob("*"):
-            rel = path.relative_to(root).as_posix()
+            rel = prefix + path.relative_to(root).as_posix()
             if not path.is_file() or SKIP.search("/" + rel) or path.stat().st_size > TEXT_MAX:
                 continue
             try:
@@ -268,21 +296,40 @@ class Section:
             except (UnicodeDecodeError, OSError):
                 continue
             for m in EMAIL.finditer(text):
-                if m.group(1).lower() not in NOT_TLD and not email_ok(m.group(0), allowed):
-                    self.emails[m.group(0).lower()] += 1
+                email = m.group(0).lower()
+                if m.group(1).lower() in NOT_TLD:
+                    continue
+                if email_ok(email, allowed):
+                    line = text.count("\n", 0, m.start()) + 1
+                    self._allow(f"email {email}", f"{rel}:{line}")
+                else:
+                    self.emails[email] += 1
 
-    def report(self, detail: bool) -> None:
+    def report(self, detail: bool, show_allowed: bool) -> None:
         n = self.total()
         tag = "ok" if not n else ("error" if self.blocks else "notice")
         verdict = "clean" if not n else ("BLOCK" if self.blocks else "warn")
+        hidden = sum(sum(c.values()) for c in self.allowed.values())
         log(tag, f"{self.name:<8} {verdict:<5} private-words={sum(self.words.values())} "
-                 f"secrets={sum(self.secrets.values())} emails={sum(self.emails.values())}"
+                 f"secrets={sum(self.secrets.values())} emails={sum(self.emails.values())}  "
+                 f"allowed={hidden} ({len(self.allowed)} entr{'y' if len(self.allowed) == 1 else 'ies'})"
                  + (f"  rules={','.join(sorted(self.secrets))}" if self.secrets else ""))
         if detail:
             for word, c in self.words.most_common():
                 log("detail", f"  {self.name} word  {word}  ×{c}")
             for email, c in self.emails.most_common():
                 log("detail", f"  {self.name} email {email}  ×{c}")
+        if show_allowed:
+            for entry, where in sorted(self.allowed.items()):
+                files = Counter(w.split(":", 1)[0] for w in where.elements())
+                log("allowed", f"  {self.name} {entry}  ×{sum(where.values())} in {len(files)} file(s)")
+                for file, c in files.most_common(ALLOWED_FILES_SHOWN):
+                    lines = sorted({w.split(":", 1)[1] for w in where if w.split(":", 1)[0] == file},
+                                   key=lambda s: (len(s), s))
+                    more = f" +{len(lines) - ALLOWED_LINES_SHOWN}" if len(lines) > ALLOWED_LINES_SHOWN else ""
+                    log("allowed", f"      {file}  ×{c}  line {', '.join(lines[:ALLOWED_LINES_SHOWN])}{more}")
+                if len(files) > ALLOWED_FILES_SHOWN:
+                    log("allowed", f"      … +{len(files) - ALLOWED_FILES_SHOWN} more file(s)")
 
 
 def default_branch(repo: Path) -> str:
@@ -292,7 +339,28 @@ def default_branch(repo: Path) -> str:
     return "main"
 
 
-def scan_ships(repo: Path, branch: str, allow_words: set[str], allow_emails: list[str]) -> Section:
+def release_excludes(repo: Path, branch: str) -> list[str]:
+    text = _git(repo, "show", f"{branch}:.release-exclude")
+    if not text and (repo / ".release-exclude").exists():
+        text = (repo / ".release-exclude").read_text()
+    return [l.strip().lstrip("/") for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
+
+
+def strip_excluded(tree: Path, patterns: list[str]) -> int:
+    """Drop what a release would strip (prefix match, like release-check). Returns files removed."""
+    removed = 0
+    for path in sorted(tree.rglob("*"), reverse=True):
+        rel = path.relative_to(tree).as_posix()
+        if any(rel == p.rstrip("/") or rel.startswith(p) for p in patterns):
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                removed += 1
+            elif path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+    return removed
+
+
+def scan_ships(repo: Path, branch: str, allow_words: dict[str, list[str]], allow_emails: list[str]) -> Section:
     sec = Section("ships", blocks=True)
     with tempfile.TemporaryDirectory(prefix="privacy-scan-") as tmp:
         tree = Path(tmp) / "tree"
@@ -304,14 +372,21 @@ def scan_ships(repo: Path, branch: str, allow_words: set[str], allow_emails: lis
         with tarfile.open(tar) as t:
             t.extractall(tree, filter="data")
         tar.unlink()
+        if branch != "production":       # preview what a release of this branch would ship
+            patterns = release_excludes(repo, branch)
+            if patterns:
+                n = strip_excluded(tree, patterns)
+                log("notice", f"{branch} is not production — left out {n} file(s) on .release-exclude")
+            else:
+                log("notice", f"{branch} is not production and has no .release-exclude — scanning all of it")
         sec.add_leaks(gitleaks("dir", tree), allow_words, tree)
         sec.add_emails(tree, allow_emails)
         if sec.secrets and VERIFY:
             verify(["filesystem", str(tree)], "ships")
     built = [repo / d for d in BUILD_DIRS if (repo / d).is_dir()]
     for d in built:
-        sec.add_leaks(gitleaks("dir", d), allow_words, d)
-        sec.add_emails(d, allow_emails)
+        sec.add_leaks(gitleaks("dir", d), allow_words, d, prefix=f"{d.relative_to(repo).as_posix()}/")
+        sec.add_emails(d, allow_emails, prefix=f"{d.relative_to(repo).as_posix()}/")
     if not built:
         log("notice", f"no build output ({', '.join(BUILD_DIRS)}) — only the branch files scanned")
     elif _git(repo, "rev-parse", "--abbrev-ref", "HEAD") != branch:
@@ -320,7 +395,7 @@ def scan_ships(repo: Path, branch: str, allow_words: set[str], allow_emails: lis
     return sec
 
 
-def scan_history(repo: Path, allow_words: set[str], allow_emails: list[str]) -> Section:
+def scan_history(repo: Path, allow_words: dict[str, list[str]], allow_emails: list[str]) -> Section:
     sec = Section("history", blocks=False)
     sec.add_leaks(gitleaks("git", repo, log_opts="--all"), allow_words, None)
     for email in _git(repo, "log", "--all", "--format=%ae%n%ce").split():
@@ -341,7 +416,7 @@ def verify(target: list[str], name: str) -> None:
     log("error" if live else "ok", f"{name:<8} trufflehog: {len(live)} verified live secret(s)")
 
 
-def cmd_scan(repo_arg: str, branch: str | None, detail: bool) -> int:
+def cmd_scan(repo_arg: str, branch: str | None, detail: bool, show_allowed: bool) -> int:
     # counts only unless --detail: never print a matched private word by default
     if not check_deps(quiet=True):
         die("dependencies or config missing — run `privacy-scan init`",
@@ -357,7 +432,7 @@ def cmd_scan(repo_arg: str, branch: str | None, detail: bool) -> int:
     ships = scan_ships(repo, branch, words, emails)
     history = scan_history(repo, words, emails)
     for sec in (ships, history):
-        sec.report(detail)
+        sec.report(detail, show_allowed)
     if ships.total():
         log("error", f"{repo.name}: what ships leaks — fix before release")
         return 1
@@ -466,6 +541,8 @@ def main() -> int:
     parser.add_argument("args", nargs="*", help="init [repo] | <repo> [branch] | install | uninstall")
     parser.add_argument("--verify", action="store_true", help="trufflehog: check found secrets are live")
     parser.add_argument("--detail", action="store_true", help="per-word/email counts (prints private text)")
+    parser.add_argument("--allowed", action="store_true",
+                        help="where .privacy-allow hid a match: entry → file:line (prints the allowed words)")
     ns = parser.parse_args()
     args = ns.args
     if not args:
@@ -480,7 +557,7 @@ def main() -> int:
     if len(args) > 2:
         parser.error("too many arguments")
     VERIFY = ns.verify
-    return cmd_scan(args[0], args[1] if len(args) == 2 else None, ns.detail)
+    return cmd_scan(args[0], args[1] if len(args) == 2 else None, ns.detail, ns.allowed)
 
 
 if __name__ == "__main__":

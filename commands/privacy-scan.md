@@ -1,6 +1,6 @@
 ---
 description: Scan a project repo for leaks (private words, secrets, foreign emails) before it ships
-argument-hint: "[init [repo] | <repo> [branch] [--verify] [--detail] | install | uninstall]"
+argument-hint: "[init [repo] | <repo> [branch] [--verify] [--detail] [--allowed] | install | uninstall]"
 ---
 
 Run `privacy-scan $ARGUMENTS` from the user's current directory using the Bash tool.
@@ -14,6 +14,7 @@ Actions:
 - **`privacy-scan <repo> [branch]`**: scan. `ships` (branch files + build output) BLOCKS on findings (exit 1); `history` only warns. Read-only.
 - **`--verify`**: also ask trufflehog whether a found secret is still live.
 - **`--detail`**: list each matched word / email. This prints private text, so only use it when the user asks.
+- **`--allowed`**: list where `.privacy-allow` hid a match (entry → file:line). Entries can be scoped: `word: X  in: <glob>, …`.
 - **`privacy-scan install` / `uninstall`**: manage both symlinks. Idempotent.
 
 After it returns, surface the `[ok]` / `[error]` / `[notice]` / `[install]` log lines to the user. Do NOT improvise steps the tool does not perform, and never run the printed `sudo` install lines yourself: the user types them.
