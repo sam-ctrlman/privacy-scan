@@ -1,11 +1,29 @@
 #!/usr/bin/env python3
-"""privacy-scan — TODO: one-line description of what this tool automates.
+"""privacy-scan — scan a project repo for leaks before it ships.
 
 Usage:
-  privacy-scan               # run the workflow (default)
-  privacy-scan install       # symlink into ~/.local/bin + ~/.claude/commands
-  privacy-scan uninstall     # remove those symlinks
-  privacy-scan --help
+  privacy-scan init                  # check dependencies + config (run once before first use)
+  privacy-scan init <repo>           # also write <repo>/.privacy-allow (the repo's exceptions)
+  privacy-scan <repo> [branch]       # scan; branch defaults to production, else main
+  privacy-scan <repo> [branch] --verify   # + trufflehog: is a found secret still live?
+  privacy-scan <repo> [branch] --detail   # per-word / per-email counts (prints private text!)
+  privacy-scan install | uninstall   # symlinks into ~/.local/bin + ~/.claude/commands
+
+What it checks:
+  ships   = the branch's files + the local build output (public/ is in the tree;
+            .next/static, .next/server/app). Private words, secrets and foreign
+            email addresses here BLOCK (exit 1).
+  history = every commit (gitleaks git --all) + every author/committer email.
+            Findings here only WARN: history can't be cleaned without a rewrite.
+
+A private word is a match of the `private-word` rule in the gitleaks config
+(default ~/.config/gitleaks/private.toml, override with PRIVACY_SCAN_CONFIG).
+<repo>/.privacy-allow lists the repo's exceptions, one per line:
+  word: <text>      a private word that is this project's own public name
+  email: <pattern>  an allowed email (author or in files); fnmatch, e.g. *@example.com
+
+Output is counts only unless --detail. Exit codes: 0 clean (warnings allowed),
+1 findings that block, 2 usage, 4 config missing, 5 gitleaks missing.
 
 Scaffolded by `forge`. The tool name is derived from the repo directory, so
 nothing here is hardcoded — rename the repo and it follows.
@@ -14,9 +32,16 @@ nothing here is hardcoded — rename the repo and it follows.
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import json
+import os
+import re
 import shutil
-import subprocess  # noqa: F401  (kept for convenience when adding workflow steps)
+import subprocess
 import sys
+import tarfile
+import tempfile
+from collections import Counter
 from pathlib import Path
 
 
@@ -33,18 +58,310 @@ TOOL_NAME = Path(__file__).resolve().parent.parent.name
 SYMLINK_TARGET = Path.home() / ".local" / "bin" / TOOL_NAME
 CLAUDE_COMMAND_TARGET = Path.home() / ".claude" / "commands" / f"{TOOL_NAME}.md"
 
+PRIVATE_CONFIG = Path(os.environ.get("PRIVACY_SCAN_CONFIG",
+                                     Path.home() / ".config" / "gitleaks" / "private.toml"))
+PRIVATE_RULE = "private-word"
+ALLOW_FILE = ".privacy-allow"
+NOREPLY = ("*@users.noreply.github.com", "noreply@github.com")
+SKIP = re.compile(r"(^|/)(node_modules|\.git|\.claude|\.gemini|\.codex|\.antigravity|\.agents|__pycache__)/")
+BUILD_DIRS = (".next/static", ".next/server/app")
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.([A-Za-z]{2,})\b")
+# x@2x.png, pkg@1.2.3/index.js … look like emails but are file names
+NOT_TLD = {"png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "ico", "js", "mjs", "cjs", "css", "map",
+           "json", "ts", "tsx", "jsx", "md", "mdx", "html", "txt", "woff", "woff2", "ttf", "otf"}
+TEXT_MAX = 5 * 1024 * 1024
+
+# name → (required, pacman, apt, brew); None = not in that manager's main repos
+PACKAGES = {
+    "gitleaks": (True, "gitleaks", "gitleaks", "gitleaks"),
+    "pre-commit": (False, "pre-commit", "pre-commit", "pre-commit"),
+    "trufflehog": (False, None, None, "trufflehog"),
+    "git-filter-repo": (False, "git-filter-repo", "git-filter-repo", "git-filter-repo"),
+}
+ROLES = {
+    "gitleaks": "scan engine (private words + secrets)",
+    "pre-commit": "per-repo hook chain",
+    "trufflehog": "--verify: is a found secret still live",
+    "git-filter-repo": "history rewrite, only behind its own gate",
+}
+VERIFY = False
+
 
 def _command_source() -> Path:
     return Path(__file__).resolve().parent.parent / "commands" / f"{TOOL_NAME}.md"
 
 
-# ---------- the workflow ----------
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True).stdout.strip()
 
-def cmd_run() -> int:
-    # TODO: replace this body with the deterministic steps this tool automates.
-    # Keep every step idempotent: begin with a [skip] fast-path when the work
-    # is already done. Use log("ok"/"skip"/"install"/"notice"/"error", ...).
-    log("notice", f"{TOOL_NAME}: workflow not implemented yet — edit {Path(__file__).resolve()}")
+
+# ---------- init: dependencies + config ----------
+
+def _install_hint(missing: list[str]) -> list[str]:
+    if shutil.which("pacman"):
+        repo = [p for p in missing if PACKAGES[p][1]]
+        aur = [p for p in missing if not PACKAGES[p][1]]
+        return ([f"sudo pacman -S --needed {' '.join(repo)}"] if repo else []) + \
+               ([f"paru -S {' '.join(aur)}   # AUR (or your AUR helper)"] if aur else [])
+    if shutil.which("apt"):
+        repo = [p for p in missing if PACKAGES[p][2]]
+        other = [p for p in missing if not PACKAGES[p][2]]
+        return ([f"sudo apt install {' '.join(repo)}"] if repo else []) + \
+               [f"{p}: see the project's install docs (not in apt)" for p in other]
+    if shutil.which("brew"):
+        return [f"brew install {' '.join(missing)}"]
+    return [f"install with your package manager: {' '.join(missing)}"]
+
+
+def check_deps(quiet: bool = False) -> bool:
+    """True when every required dependency and the config are in place."""
+    ok = True
+    missing = []
+    for name, (required, *_rest) in PACKAGES.items():
+        if shutil.which(name):
+            if not quiet:
+                log("ok", f"{name:<16} {ROLES[name]}")
+            continue
+        missing.append(name)
+        if required:
+            ok = False
+            log("error", f"{name:<16} missing (required) — {ROLES[name]}")
+        elif not quiet:
+            log("notice", f"{name:<16} missing (optional) — {ROLES[name]}")
+    if missing and (not ok or not quiet):
+        for line in _install_hint(missing):
+            log("install", line)
+    if not PRIVATE_CONFIG.exists():
+        ok = False
+        log("error", f"{PRIVATE_CONFIG} missing — it holds the `{PRIVATE_RULE}` rule")
+    else:
+        mode = PRIVATE_CONFIG.stat().st_mode & 0o777
+        if PRIVATE_RULE not in PRIVATE_CONFIG.read_text():
+            ok = False
+            log("error", f"{PRIVATE_CONFIG} has no `{PRIVATE_RULE}` rule")
+        elif mode & 0o077:
+            log("notice", f"{PRIVATE_CONFIG} is mode {mode:o}; chmod 600 keeps the word list private")
+        elif not quiet:
+            log("ok", f"private-word config {PRIVATE_CONFIG}")
+    if not quiet:
+        hooks = subprocess.run(["git", "config", "--global", "core.hooksPath"],
+                               capture_output=True, text=True).stdout.strip()
+        hook = Path(os.path.expanduser(hooks)) / "pre-commit" if hooks else None
+        if hook and os.access(hook, os.X_OK):
+            log("ok", f"global pre-commit hook {hook}")
+        else:
+            log("notice", "no global pre-commit hook (core.hooksPath) — commits are not checked")
+    return ok
+
+
+def init_repo(repo: Path) -> int:
+    allow = repo / ALLOW_FILE
+    if allow.exists():
+        log("skip", f"{allow} exists")
+    else:
+        email = _git(repo, "config", "--local", "user.email")
+        allow.write_text(
+            "# privacy-scan exceptions for this repo. Never ships: listed in .release-exclude.\n"
+            "# word: <text>      a private word that is this project's own public name (exact, any case)\n"
+            "# email: <pattern>  an allowed email, author or in files (fnmatch, e.g. *@example.com)\n"
+            + (f"email: {email}\n" if email else "")
+        )
+        log("ok", f"wrote {allow}" + ("" if email else " (no local identity — add email: lines)"))
+    excl = repo / ".release-exclude"
+    if excl.exists():
+        text = excl.read_text()
+        if ALLOW_FILE in (l.strip() for l in text.splitlines()):
+            log("skip", f"{ALLOW_FILE} already in .release-exclude")
+        else:
+            with excl.open("a") as f:
+                f.write(("" if not text or text.endswith("\n") else "\n") + ALLOW_FILE + "\n")
+            log("ok", f"added {ALLOW_FILE} to .release-exclude")
+    else:
+        log("notice", "no .release-exclude — make sure .privacy-allow never ships")
+    return 0
+
+
+def cmd_init(repo: str | None) -> int:
+    if not check_deps():
+        log("error", "init failed — fix the errors above, then run init again")
+        return 5 if not shutil.which("gitleaks") else 4
+    log("ok", "dependencies + config ready")
+    return init_repo(_repo_path(repo)) if repo else 0
+
+
+# ---------- scan ----------
+
+def _repo_path(repo: str) -> Path:
+    path = Path(repo).expanduser().resolve()
+    if not (path / ".git").exists():
+        die(f"{path} is not a git repo", code=2)
+    return path
+
+
+def load_allow(repo: Path) -> tuple[set[str], list[str]]:
+    words, emails = set(), list(NOREPLY)
+    me = _git(repo, "config", "--local", "user.email")
+    if me:
+        emails.append(me)
+    allow = repo / ALLOW_FILE
+    if allow.exists():
+        for line in allow.read_text().splitlines():
+            key, _, value = line.partition(":")
+            value = value.strip()
+            if line.lstrip().startswith("#") or not value:
+                continue
+            if key.strip() == "word":
+                words.add(value.lower())
+            elif key.strip() == "email":
+                emails.append(value.lower())
+    return words, emails
+
+
+def email_ok(email: str, allowed: list[str]) -> bool:
+    return any(fnmatch.fnmatch(email.lower(), pat.lower()) for pat in allowed)
+
+
+def gitleaks(mode: str, target: Path, log_opts: str | None = None) -> list[dict]:
+    # no --redact: matched text stays in memory so the allow list can filter it; never printed by default
+    cmd = ["gitleaks", mode, "--no-banner", "--exit-code", "0", "-c", str(PRIVATE_CONFIG),
+           "-r", "-", "-f", "json"]
+    if log_opts:
+        cmd.append(f"--log-opts={log_opts}")
+    result = subprocess.run([*cmd, str(target)], capture_output=True, text=True)
+    if result.returncode != 0:
+        die(f"gitleaks {mode} failed: {result.stderr.strip()[:200]}")
+    return json.loads(result.stdout or "[]")
+
+
+class Section:
+    """Findings for one part of the scan; holds matched text in memory only."""
+
+    def __init__(self, name: str, blocks: bool):
+        self.name, self.blocks = name, blocks
+        self.words: Counter = Counter()
+        self.secrets: Counter = Counter()
+        self.emails: Counter = Counter()
+
+    def total(self) -> int:
+        return sum(self.words.values()) + sum(self.secrets.values()) + sum(self.emails.values())
+
+    def add_leaks(self, findings: list[dict], allow_words: set[str], root: Path | None) -> None:
+        for f in findings:
+            file = f.get("File", "")
+            rel = os.path.relpath(file, root) if root and file.startswith(str(root)) else file
+            if SKIP.search("/" + rel):
+                continue
+            if f.get("RuleID") == PRIVATE_RULE:
+                word = (f.get("Secret") or f.get("Match") or "").lower()
+                if word not in allow_words:
+                    self.words[word] += 1
+            else:
+                self.secrets[f.get("RuleID", "?")] += 1
+
+    def add_emails(self, root: Path, allowed: list[str]) -> None:
+        for path in root.rglob("*"):
+            rel = path.relative_to(root).as_posix()
+            if not path.is_file() or SKIP.search("/" + rel) or path.stat().st_size > TEXT_MAX:
+                continue
+            try:
+                text = path.read_text(errors="strict")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for m in EMAIL.finditer(text):
+                if m.group(1).lower() not in NOT_TLD and not email_ok(m.group(0), allowed):
+                    self.emails[m.group(0).lower()] += 1
+
+    def report(self, detail: bool) -> None:
+        n = self.total()
+        tag = "ok" if not n else ("error" if self.blocks else "notice")
+        verdict = "clean" if not n else ("BLOCK" if self.blocks else "warn")
+        log(tag, f"{self.name:<8} {verdict:<5} private-words={sum(self.words.values())} "
+                 f"secrets={sum(self.secrets.values())} emails={sum(self.emails.values())}"
+                 + (f"  rules={','.join(sorted(self.secrets))}" if self.secrets else ""))
+        if detail:
+            for word, c in self.words.most_common():
+                log("detail", f"  {self.name} word  {word}  ×{c}")
+            for email, c in self.emails.most_common():
+                log("detail", f"  {self.name} email {email}  ×{c}")
+
+
+def default_branch(repo: Path) -> str:
+    if _git(repo, "rev-parse", "-q", "--verify", "production"):
+        return "production"
+    log("notice", "no production branch — scanning main")
+    return "main"
+
+
+def scan_ships(repo: Path, branch: str, allow_words: set[str], allow_emails: list[str]) -> Section:
+    sec = Section("ships", blocks=True)
+    with tempfile.TemporaryDirectory(prefix="privacy-scan-") as tmp:
+        tree = Path(tmp) / "tree"
+        archive = subprocess.run(["git", "-C", str(repo), "archive", branch], capture_output=True)
+        if archive.returncode != 0:
+            die(f"git archive {branch} failed: {archive.stderr.decode().strip()[:200]}", code=2)
+        tar = Path(tmp) / "tree.tar"
+        tar.write_bytes(archive.stdout)
+        with tarfile.open(tar) as t:
+            t.extractall(tree, filter="data")
+        tar.unlink()
+        sec.add_leaks(gitleaks("dir", tree), allow_words, tree)
+        sec.add_emails(tree, allow_emails)
+        if sec.secrets and VERIFY:
+            verify(["filesystem", str(tree)], "ships")
+    built = [repo / d for d in BUILD_DIRS if (repo / d).is_dir()]
+    for d in built:
+        sec.add_leaks(gitleaks("dir", d), allow_words, d)
+        sec.add_emails(d, allow_emails)
+    if not built:
+        log("notice", f"no build output ({', '.join(BUILD_DIRS)}) — only the branch files scanned")
+    elif _git(repo, "rev-parse", "--abbrev-ref", "HEAD") != branch:
+        log("notice", f"build output is from the checkout on {_git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')}, "
+                      f"not {branch}")
+    return sec
+
+
+def scan_history(repo: Path, allow_words: set[str], allow_emails: list[str]) -> Section:
+    sec = Section("history", blocks=False)
+    sec.add_leaks(gitleaks("git", repo, log_opts="--all"), allow_words, None)
+    for email in _git(repo, "log", "--all", "--format=%ae%n%ce").split():
+        if not email_ok(email, allow_emails):
+            sec.emails[email.lower()] += 1
+    if sec.secrets and VERIFY:
+        verify(["git", f"file://{repo}"], "history")
+    return sec
+
+
+def verify(target: list[str], name: str) -> None:
+    if not shutil.which("trufflehog"):
+        log("notice", "--verify needs trufflehog (see `privacy-scan init`)")
+        return
+    result = subprocess.run(["trufflehog", *target, "--only-verified", "--json", "--no-update"],
+                            capture_output=True, text=True)
+    live = [l for l in result.stdout.splitlines() if l.startswith("{")]
+    log("error" if live else "ok", f"{name:<8} trufflehog: {len(live)} verified live secret(s)")
+
+
+def cmd_scan(repo_arg: str, branch: str | None, detail: bool) -> int:
+    # counts only unless --detail: never print a matched private word by default
+    if not check_deps(quiet=True):
+        die("dependencies or config missing — run `privacy-scan init`",
+            code=5 if not shutil.which("gitleaks") else 4)
+    repo = _repo_path(repo_arg)
+    branch = branch or default_branch(repo)
+    if not _git(repo, "rev-parse", "-q", "--verify", branch):
+        die(f"no branch {branch} in {repo.name}", code=2)
+    words, emails = load_allow(repo)
+    if not (repo / ALLOW_FILE).exists():
+        log("notice", f"no {ALLOW_FILE} — run `privacy-scan init {repo}` to list this repo's public names")
+    log("info", f"{repo.name} @ {branch}  (allow: {len(words)} word(s), {len(emails)} email pattern(s))")
+    ships = scan_ships(repo, branch, words, emails)
+    history = scan_history(repo, words, emails)
+    for sec in (ships, history):
+        sec.report(detail)
+    if ships.total():
+        log("error", f"{repo.name}: what ships leaks — fix before release")
+        return 1
+    log("ok", f"{repo.name}: what ships is clean" + (" (history has warnings)" if history.total() else ""))
     return 0
 
 
@@ -140,23 +457,30 @@ def _uninstall_claude_command() -> None:
 # ---------- entry point ----------
 
 def main() -> int:
+    global VERIFY
     parser = argparse.ArgumentParser(
         prog=TOOL_NAME,
-        description="TODO: privacy-scan — describe what this tool does.",
+        description="Scan a project repo for leaks (private words, secrets, foreign emails) before it ships.",
+        epilog="Actions: init [repo] · <repo> [branch] · install · uninstall",
     )
-    parser.add_argument(
-        "action",
-        nargs="?",
-        default="run",
-        choices=["run", "install", "uninstall"],
-        help="run (default) = do the work; install/uninstall = manage symlinks",
-    )
-    args = parser.parse_args()
-    if args.action == "install":
+    parser.add_argument("args", nargs="*", help="init [repo] | <repo> [branch] | install | uninstall")
+    parser.add_argument("--verify", action="store_true", help="trufflehog: check found secrets are live")
+    parser.add_argument("--detail", action="store_true", help="per-word/email counts (prints private text)")
+    ns = parser.parse_args()
+    args = ns.args
+    if not args:
+        parser.print_help()
+        return 2
+    if args == ["install"]:
         return cmd_install()
-    if args.action == "uninstall":
+    if args == ["uninstall"]:
         return cmd_uninstall()
-    return cmd_run()
+    if args[0] == "init" and len(args) <= 2:
+        return cmd_init(args[1] if len(args) == 2 else None)
+    if len(args) > 2:
+        parser.error("too many arguments")
+    VERIFY = ns.verify
+    return cmd_scan(args[0], args[1] if len(args) == 2 else None, ns.detail)
 
 
 if __name__ == "__main__":

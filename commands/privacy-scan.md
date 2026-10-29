@@ -1,6 +1,6 @@
 ---
-description: "TODO: privacy-scan — describe what this slash command does"
-argument-hint: "[run|install|uninstall]"
+description: Scan a project repo for leaks (private words, secrets, foreign emails) before it ships
+argument-hint: "[init [repo] | <repo> [branch] [--verify] [--detail] | install | uninstall]"
 ---
 
 Run `privacy-scan $ARGUMENTS` from the user's current directory using the Bash tool.
@@ -9,10 +9,13 @@ Run `privacy-scan $ARGUMENTS` from the user's current directory using the Bash t
 
 Actions:
 
-- **`privacy-scan`** or **`privacy-scan run`** — TODO: the workflow this tool automates (not implemented yet — edit `cmd_run()` in the script).
-- **`privacy-scan install`** — create both symlinks (bin + Claude command). Idempotent.
-- **`privacy-scan uninstall`** — remove both symlinks. Idempotent.
+- **`privacy-scan init`**: check the 4 dependencies (gitleaks required; pre-commit, trufflehog, git-filter-repo optional) and the private-word config. Prints install commands for anything missing; it never runs sudo. Run this before first use. A scan refuses while init would fail.
+- **`privacy-scan init <repo>`**: same, then write `<repo>/.privacy-allow` (the repo's exceptions) and add it to `.release-exclude`. This edits files in the repo, so in a gated workspace it needs a runbook step first.
+- **`privacy-scan <repo> [branch]`**: scan. `ships` (branch files + build output) BLOCKS on findings (exit 1); `history` only warns. Read-only.
+- **`--verify`**: also ask trufflehog whether a found secret is still live.
+- **`--detail`**: list each matched word / email. This prints private text, so only use it when the user asks.
+- **`privacy-scan install` / `uninstall`**: manage both symlinks. Idempotent.
 
-After it returns, surface the `[ok]` / `[error]` / `[notice]` log lines to the user. Do NOT improvise steps the tool does not perform — the tool owns its workflow.
+After it returns, surface the `[ok]` / `[error]` / `[notice]` / `[install]` log lines to the user. Do NOT improvise steps the tool does not perform, and never run the printed `sudo` install lines yourself: the user types them.
 
-Pass through `$ARGUMENTS` verbatim. Valid args: `run`, `install`, `uninstall`, or empty (defaults to `run`).
+Pass through `$ARGUMENTS` verbatim.
