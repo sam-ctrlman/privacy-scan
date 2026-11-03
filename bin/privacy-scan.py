@@ -8,7 +8,7 @@ Usage:
   privacy-scan <repo> [branch] --verify   # + trufflehog: is a found secret still live?
   privacy-scan <repo> [branch] --detail   # per-word / per-email counts (prints private text!)
   privacy-scan <repo> [branch] --allowed  # where .privacy-allow hid a match: entry → file:line
-  privacy-scan install | uninstall   # symlinks into ~/.local/bin + ~/.claude/commands
+  privacy-scan install | uninstall   # symlinks into ~/.local/bin + ~/.claude/skills
 
 What it checks:
   ships   = the branch's files + the local build output (public/ is in the tree;
@@ -60,7 +60,8 @@ def die(msg: str, code: int = 1):
 
 TOOL_NAME = Path(__file__).resolve().parent.parent.name
 SYMLINK_TARGET = Path.home() / ".local" / "bin" / TOOL_NAME
-CLAUDE_COMMAND_TARGET = Path.home() / ".claude" / "commands" / f"{TOOL_NAME}.md"
+CLAUDE_SKILL_TARGET = Path.home() / ".claude" / "skills" / TOOL_NAME
+LEGACY_COMMAND_TARGET = Path.home() / ".claude" / "commands" / f"{TOOL_NAME}.md"
 
 PRIVATE_CONFIG = Path(os.environ.get("PRIVACY_SCAN_CONFIG",
                                      Path.home() / ".config" / "gitleaks" / "private.toml"))
@@ -93,8 +94,8 @@ ROLES = {
 VERIFY = False
 
 
-def _command_source() -> Path:
-    return Path(__file__).resolve().parent.parent / "commands" / f"{TOOL_NAME}.md"
+def _skill_source() -> Path:
+    return Path(__file__).resolve().parent.parent / "skills" / TOOL_NAME
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -451,7 +452,7 @@ def cmd_install() -> int:
     else:
         log("skip", f"script already executable: {script_path}")
     _install_bin_symlink(script_path)
-    _install_claude_command()
+    _install_claude_skill()
     return _install_check_path()
 
 
@@ -470,24 +471,53 @@ def _install_bin_symlink(script_path: Path) -> None:
     log("ok", f"bin symlink created: {SYMLINK_TARGET} -> {script_path}")
 
 
-def _install_claude_command() -> None:
-    source = _command_source()
-    if not source.exists():
-        log("notice", f"slash command source not found at {source} — skipping Claude integration")
+def _install_claude_skill() -> None:
+    source = _skill_source()
+    if not (source / "SKILL.md").exists():
+        log("notice", f"skill source not found at {source / 'SKILL.md'} — skipping Claude integration")
         return
-    CLAUDE_COMMAND_TARGET.parent.mkdir(parents=True, exist_ok=True)
-    if CLAUDE_COMMAND_TARGET.is_symlink():
-        current = CLAUDE_COMMAND_TARGET.resolve()
-        if current == source:
-            log("skip", f"slash command symlink already correct: {CLAUDE_COMMAND_TARGET} -> {source}")
-            return
-        log("info", f"replacing existing slash command symlink ({CLAUDE_COMMAND_TARGET} -> {current})")
-        CLAUDE_COMMAND_TARGET.unlink()
-    elif CLAUDE_COMMAND_TARGET.exists():
-        die(f"{CLAUDE_COMMAND_TARGET} exists and is not a symlink — refusing to overwrite")
-    CLAUDE_COMMAND_TARGET.symlink_to(source)
-    log("ok", f"slash command symlink created: {CLAUDE_COMMAND_TARGET} -> {source}")
+    _remove_legacy_command()
+    target = CLAUDE_SKILL_TARGET
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink() and target.resolve() == source:
+        log("skip", f"skill symlink already correct: {target} -> {source}")
+    else:
+        if target.is_symlink():
+            log("info", f"replacing existing skill symlink ({target} -> {target.resolve()})")
+            target.unlink()
+        elif target.exists():
+            die(f"{target} exists and is not a symlink — refusing to overwrite")
+        target.symlink_to(source)
+        log("ok", f"skill symlink created: {target} -> {source}")
+    _check_skill_ignored()
 
+
+def _remove_legacy_command() -> None:
+    # Before TOOL-SKILLDIR this tool linked ~/.claude/skills/<tool>.md; a leftover link would clash with the skill.
+    legacy = LEGACY_COMMAND_TARGET
+    if not legacy.is_symlink():
+        if legacy.exists():
+            log("notice", f"{legacy} is a real file, not this tool's link — left alone; remove it by hand if it duplicates the skill")
+        return
+    was = legacy.resolve()
+    if _skill_source().parent.parent in was.parents:
+        legacy.unlink()
+        log("ok", f"removed old slash command symlink: {legacy} (was -> {was})")
+    else:
+        log("notice", f"{legacy} points outside this tool ({was}) — left alone")
+
+
+def _check_skill_ignored() -> None:
+    # Warn only, never edit ~/.claude/.gitignore (TOOL-SKILLDIR D3=a).
+    claude_dir = CLAUDE_SKILL_TARGET.parent.parent
+    rel = f"skills/{CLAUDE_SKILL_TARGET.name}"
+    try:
+        r = subprocess.run(["git", "-C", str(claude_dir), "check-ignore", "-q", rel], capture_output=True)
+    except FileNotFoundError:
+        return
+    # 0 = ignored · 1 = not ignored · 128 = ~/.claude is not a git repo (fresh machine): stay quiet
+    if r.returncode == 1:
+        log("notice", f"{CLAUDE_SKILL_TARGET} is not git-ignored — add this line to {claude_dir}/.gitignore:  /{rel}")
 
 def _install_check_path() -> int:
     on_path = shutil.which(TOOL_NAME)
@@ -502,7 +532,7 @@ def _install_check_path() -> int:
 def cmd_uninstall() -> int:
     script_path = Path(__file__).resolve()
     _uninstall_bin_symlink()
-    _uninstall_claude_command()
+    _uninstall_claude_skill()
     log("info", f"to reinstall: python3 {script_path} install")
     return 0
 
@@ -518,16 +548,17 @@ def _uninstall_bin_symlink() -> None:
     log("ok", f"removed bin symlink: {SYMLINK_TARGET} (was -> {target})")
 
 
-def _uninstall_claude_command() -> None:
-    if not CLAUDE_COMMAND_TARGET.is_symlink() and not CLAUDE_COMMAND_TARGET.exists():
-        log("info", f"no slash command symlink at {CLAUDE_COMMAND_TARGET} to remove")
-        return
-    if not CLAUDE_COMMAND_TARGET.is_symlink():
-        die(f"{CLAUDE_COMMAND_TARGET} exists but is not a symlink — refusing to remove")
-    target = CLAUDE_COMMAND_TARGET.resolve()
-    CLAUDE_COMMAND_TARGET.unlink()
-    log("ok", f"removed slash command symlink: {CLAUDE_COMMAND_TARGET} (was -> {target})")
-
+def _uninstall_claude_skill() -> None:
+    target = CLAUDE_SKILL_TARGET
+    if not target.is_symlink() and not target.exists():
+        log("info", f"no skill symlink at {target} to remove")
+    elif not target.is_symlink():
+        die(f"{target} exists but is not a symlink — refusing to remove")
+    else:
+        was = target.resolve()
+        target.unlink()
+        log("ok", f"removed skill symlink: {target} (was -> {was})")
+    _remove_legacy_command()
 
 # ---------- entry point ----------
 

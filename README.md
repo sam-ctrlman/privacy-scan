@@ -79,6 +79,6 @@ Exit codes: 0 clean (warnings allowed) · 1 blocking findings · 2 usage · 4 co
 ~/tools/projects/privacy-scan/
 ├── README.md
 ├── bin/privacy-scan.py
-├── commands/privacy-scan.md
+├── skills/privacy-scan/SKILL.md
 └── docs/ (PROJECT.md, STATUS.md)
 ```

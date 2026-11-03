@@ -1,11 +1,13 @@
 ---
+name: privacy-scan
 description: Scan a project repo for leaks (private words, secrets, foreign emails) before it ships
 argument-hint: "[init [repo] | <repo> [branch] [--verify] [--detail] [--allowed] | install | uninstall]"
+disable-model-invocation: true
 ---
 
 Run `privacy-scan $ARGUMENTS` from the user's current directory using the Bash tool.
 
-`privacy-scan` is a Python tool at `~/tools/projects/privacy-scan/bin/privacy-scan.py` (symlinked to `~/.local/bin/privacy-scan`). This slash command file is at `~/tools/projects/privacy-scan/commands/privacy-scan.md` (symlinked to `~/.claude/commands/privacy-scan.md`).
+`privacy-scan` is a Python tool at `~/tools/projects/privacy-scan/bin/privacy-scan.py` (symlinked to `~/.local/bin/privacy-scan`). This skill is at `~/tools/projects/privacy-scan/skills/privacy-scan/SKILL.md` (its folder is symlinked to `~/.claude/skills/privacy-scan`).
 
 Actions:
 
