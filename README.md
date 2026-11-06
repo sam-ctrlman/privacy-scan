@@ -61,7 +61,7 @@ regex = '''(?i)(word1|word2)'''
 ```
 word: my-brand                          # this project's own public name, allowed everywhere
 word: build-host  in: deploy/*.cjs      # allowed only in these files; elsewhere it still blocks
-email: dev@example.com                  # an allowed email (author or in files); fnmatch patterns ok
+email: user@example.com                 # an allowed email (author or in files); fnmatch patterns ok
 email: *@example.com
 ```
 
