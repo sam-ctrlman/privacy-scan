@@ -3,8 +3,7 @@
 <!-- created 2026-10-30 · board prefix TOOL-PSCAN (plan IDs TOOL-PRIVSCAN-*) · workspace tools -->
 
 ## Goal
-Scans a project repo for leaks before it ships: private words (names of internal projects, hosts,
-people, emails), secrets, and commit authors that are not allowed. What ships blocks; history only warns.
+Pre-release Git leak scanner CLI (Gitleaks + TruffleHog): block private words, secrets, and unauthorized emails in code & build output.
 
 ## Users
 A developer who keeps private names out of what their projects publish.

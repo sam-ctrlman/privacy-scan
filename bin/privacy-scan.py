@@ -215,6 +215,7 @@ def load_allow(repo: Path) -> tuple[dict[str, list[str]], list[str]]:
     allow = repo / ALLOW_FILE
     if allow.exists():
         for line in allow.read_text().splitlines():
+            line = re.sub(r"\s+#.*$", "", line)
             key, _, value = line.partition(":")
             value = value.strip()
             if line.lstrip().startswith("#") or not value:
